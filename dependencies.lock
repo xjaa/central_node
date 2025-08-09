@@ -1,0 +1,41 @@
+dependencies:
+  idf:
+    source:
+      type: idf
+    version: 5.5.0
+  k0i05/esp_ssd1306:
+    component_hash: 7df2506f5eddfddc910cb716dcdc1b673ca5df332d25a8dc3a49e071e6ed2390
+    dependencies:
+    - name: idf
+      require: private
+      version: '>5.3.0'
+    - name: k0i05/esp_type_utils
+      registry_url: https://components.espressif.com
+      require: private
+      version: '>=1.0.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    targets:
+    - esp32
+    - esp32s3
+    version: 1.2.6
+  k0i05/esp_type_utils:
+    component_hash: 0315aa7577c96037b601be7499c4b434d32d4ae381e90308ac0da3323e3887dc
+    dependencies:
+    - name: idf
+      require: private
+      version: '>5.3.0'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    targets:
+    - esp32
+    - esp32s3
+    version: 1.2.6
+direct_dependencies:
+- idf
+- k0i05/esp_ssd1306
+manifest_hash: 26344c1d46e58844adf192c11c1127fddbd25b8d2e8400b60a2f2f7bb75ed9ec
+target: esp32s3
+version: 2.0.0

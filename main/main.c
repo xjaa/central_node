@@ -46,7 +46,7 @@ static const char *TAG = "NIMBLE_OBSERVER_OLED";
 // 目标广播数据配置 (必须与传感器节点匹配)
 #define CUSTOM_MANU_ID       0x02E5 // Espressif Inc. 的官方蓝牙公司ID
 #define MAX_SENSOR_NODES     36     // 支持的最大节点数量
-#define MA 1
+
 
 // 传感器节点广播的数据包结构
 #pragma pack(push, 1)

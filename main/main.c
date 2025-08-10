@@ -1,28 +1,31 @@
 /**
  * @file main.c
- * @brief ROBUST: ESP32 NimBLE Observer with OLED Display for Multi-Node Network
+ * @brief FINAL STABLE: ESP32 NimBLE Observer with SD Card Logging and OLED Display
  *
- * This device operates in a connectionless observer mode:
- * 1. It continuously scans for advertising packets.
- * 2. It filters for packets containing a specific Manufacturer ID.
- * 3. It parses sensor data and correctly handles error codes for individual sensors.
- * 4. It stores the latest data for up to 36 nodes.
- * 5. A dedicated task cyclically displays node data, using partial refresh to prevent flicker
- * and implementing a timeout to show offline nodes.
- * This is a highly scalable, power-efficient architecture for data collection.
+ * This version re-enables all functionality (Wi-Fi, SD Card, BLE, OLED)
+ * with a robust, ordered startup sequence and an enhanced status display on the OLED
+ * to provide clear feedback on system initialization, including error codes.
  */
 #include <stdio.h>
 #include <string.h>
-#include <limits.h> // For INT16_MAX etc.
-#include <math.h>   // For isnan
+#include <limits.h>
+#include <math.h>
+#include <time.h>
+#include <sys/stat.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
-#include "time.h"
+#include "esp_wifi.h"
+#include "esp_sntp.h"
+#include "esp_vfs_fat.h"
+#include "driver/sdspi_host.h"
+#include "sdmmc_cmd.h"
 
-// NimBLE 协议栈
+// NimBLE
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -30,25 +33,35 @@
 #include "services/gap/ble_svc_gap.h"
 #include "host/ble_hs_id.h"
 
-// OLED 驱动
+// OLED
 #include "driver/i2c_master.h"
 #include "ssd1306.h"
 
-static const char *TAG = "NIMBLE_OBSERVER_OLED";
+static const char *TAG = "CENTRAL_LOGGER";
 
-// I2C 和 OLED 配置
+// --- Wi-Fi & SNTP Configuration ---
+#define WIFI_SSID      "luckyp"
+#define WIFI_PASSWORD  "lyp19990308"
+
+// --- SD Card SPI Configuration ---
+#define SD_CARD_MOUNT_POINT "/sdcard"
+#define PIN_NUM_MISO 13
+#define PIN_NUM_MOSI 11
+#define PIN_NUM_CLK  12
+#define PIN_NUM_CS   10
+
+// --- I2C & OLED Configuration ---
 #define I2C_PORT_ID          I2C_NUM_0
 #define I2C_SCL_PIN          GPIO_NUM_4
 #define I2C_SDA_PIN          GPIO_NUM_5
-#define DISPLAY_CYCLE_TIME_S 3 // 每个节点数据显示的秒数
-#define NODE_TIMEOUT_S       30 // 节点被认为离线的秒数
+#define DISPLAY_CYCLE_TIME_S 3
+#define NODE_TIMEOUT_S       30
 
-// 目标广播数据配置 (必须与传感器节点匹配)
-#define CUSTOM_MANU_ID       0x02E5 // Espressif Inc. 的官方蓝牙公司ID
-#define MAX_SENSOR_NODES     36     // 支持的最大节点数量
+// --- BLE Configuration ---
+#define CUSTOM_MANU_ID       0x02E5
+#define MAX_SENSOR_NODES     36
 
-
-// 传感器节点广播的数据包结构
+// --- Data Structures ---
 #pragma pack(push, 1)
 typedef struct {
     uint16_t manu_id;
@@ -59,34 +72,131 @@ typedef struct {
 } adv_sensor_data_t;
 #pragma pack(pop)
 
-// 定义错误码 (必须与传感器节点一致)
 #define TEMP_ERROR_VAL      INT16_MAX
 #define HUMI_ERROR_VAL      UINT16_MAX
 #define LUX_ERROR_VAL       UINT16_MAX
 
-// 用于存储所有节点数据的结构
 typedef struct {
     uint8_t  node_id;
-    float    temperature; // 使用 NAN 表示错误
-    float    humidity;    // 使用 NAN 表示错误
-    uint16_t illuminance; // 使用 LUX_ERROR_VAL 表示错误
+    float    temperature;
+    float    humidity;
+    uint16_t illuminance;
     time_t   last_seen;
 } sensor_node_status_t;
 
-// 全局变量
+// --- Global Variables & Flags for startup synchronization ---
 static sensor_node_status_t g_sensor_nodes[MAX_SENSOR_NODES];
 static int g_active_node_count = 0;
+static bool g_sntp_initialized = false;
+static bool g_sd_card_mounted = false;
+static esp_err_t g_sd_card_err = ESP_OK; // *** 新增：存储SD卡错误码 ***
+static QueueHandle_t g_logging_queue;
 
-// OLED 句柄
 static i2c_master_bus_handle_t g_i2c_bus_handle = NULL;
 static ssd1306_handle_t g_oled_handle = NULL;
 
-// 函数声明
+static bool g_wifi_connected = false;
+static bool g_ble_synced = false;
+
+
+// --- Function Prototypes ---
 static void ble_central_scan(void);
 
-/**
- * @brief 初始化OLED屏幕
- */
+// --- Time Sync ---
+void time_sync_notification_cb(struct timeval *tv) {
+    ESP_LOGI(TAG, "Time synchronized");
+    g_sntp_initialized = true;
+}
+
+static void initialize_sntp(void) {
+    ESP_LOGI(TAG, "Initializing SNTP");
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_set_time_sync_notification_cb(time_sync_notification_cb);
+    esp_sntp_init();
+}
+
+// --- Wi-Fi Connection ---
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
+    if (event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "Connected to Wi-Fi. Initializing SNTP...");
+        g_wifi_connected = true;
+        initialize_sntp();
+        if (g_ble_synced) {
+            ble_central_scan();
+        }
+    } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGI(TAG, "Disconnected from Wi-Fi. Retrying...");
+        g_wifi_connected = false;
+        esp_wifi_connect();
+    }
+}
+
+static void wifi_init(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASSWORD,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+// --- SD Card ---
+static void sd_card_init(void) {
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024
+    };
+    sdmmc_card_t *card;
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+
+    spi_bus_config_t bus_cfg = {
+        .mosi_io_num = PIN_NUM_MOSI,
+        .miso_io_num = PIN_NUM_MISO,
+        .sclk_io_num = PIN_NUM_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 4000,
+    };
+    // *** 核心修改：不再使用ESP_ERROR_CHECK，而是手动检查错误 ***
+    g_sd_card_err = spi_bus_initialize(host.slot, &bus_cfg, SDSPI_DEFAULT_DMA);
+    if (g_sd_card_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize SPI bus. Error: %s", esp_err_to_name(g_sd_card_err));
+        g_sd_card_mounted = false;
+        return;
+    }
+
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = PIN_NUM_CS;
+    slot_config.host_id = host.slot;
+
+    g_sd_card_err = esp_vfs_fat_sdspi_mount(SD_CARD_MOUNT_POINT, &host, &slot_config, &mount_config, &card);
+
+    if (g_sd_card_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount SD card VFS. Error: %s", esp_err_to_name(g_sd_card_err));
+        g_sd_card_mounted = false;
+        spi_bus_free(host.slot); // 挂载失败，释放SPI总线
+    } else {
+        ESP_LOGI(TAG, "SD card mounted successfully.");
+        sdmmc_card_print_info(stdout, card);
+        g_sd_card_mounted = true;
+    }
+}
+
+// --- OLED Display ---
 static void oled_init(void) {
     i2c_master_bus_config_t i2c_bus_config = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
@@ -97,59 +207,21 @@ static void oled_init(void) {
         .flags.enable_internal_pullup = true,
     };
     ESP_ERROR_CHECK(i2c_new_master_bus(&i2c_bus_config, &g_i2c_bus_handle));
-
     ssd1306_config_t dev_cfg = I2C_SSD1306_128x64_CONFIG_DEFAULT;
     ESP_ERROR_CHECK(ssd1306_init(g_i2c_bus_handle, &dev_cfg, &g_oled_handle));
-
     ESP_LOGI(TAG, "OLED Initialized");
 }
 
-/**
- * @brief 主GAP事件回调，只处理广播包
- */
-static int ble_central_gap_event(struct ble_gap_event *event, void *arg)
-{
-    struct ble_hs_adv_fields fields;
-
+// --- BLE Logic ---
+static int ble_central_gap_event(struct ble_gap_event *event, void *arg) {
     if (event->type == BLE_GAP_EVENT_DISC) {
+        struct ble_hs_adv_fields fields;
         if (ble_hs_adv_parse_fields(&fields, event->disc.data, event->disc.length_data) == 0) {
             if (fields.mfg_data != NULL && fields.mfg_data_len == sizeof(adv_sensor_data_t)) {
                 adv_sensor_data_t *data = (adv_sensor_data_t *)fields.mfg_data;
-
                 if (data->manu_id == CUSTOM_MANU_ID) {
-                    uint8_t node_id = data->node_id;
-                    
-                    int node_index = -1;
-                    for (int i = 0; i < g_active_node_count; i++) {
-                        if (g_sensor_nodes[i].node_id == node_id) {
-                            node_index = i;
-                            break;
-                        }
-                    }
-                    if (node_index == -1 && g_active_node_count < MAX_SENSOR_NODES) {
-                        node_index = g_active_node_count;
-                        g_sensor_nodes[node_index].node_id = node_id;
-                        g_active_node_count++;
-                    }
-
-                    if (node_index != -1) {
-                        // 检查每个传感器值是否为错误码
-                        if (data->temperature == TEMP_ERROR_VAL) {
-                            g_sensor_nodes[node_index].temperature = NAN;
-                        } else {
-                            g_sensor_nodes[node_index].temperature = (float)data->temperature / 100.0f;
-                        }
-
-                        if (data->humidity == HUMI_ERROR_VAL) {
-                            g_sensor_nodes[node_index].humidity = NAN;
-                        } else {
-                            g_sensor_nodes[node_index].humidity = (float)data->humidity / 100.0f;
-                        }
-                        
-                        g_sensor_nodes[node_index].illuminance = data->illuminance;
-                        g_sensor_nodes[node_index].last_seen = time(NULL);
-
-                        ESP_LOGI(TAG, "Received data from Node ID: %d", node_id);
+                    if (g_logging_queue != NULL) {
+                        xQueueSend(g_logging_queue, data, 0);
                     }
                 }
             }
@@ -158,11 +230,7 @@ static int ble_central_gap_event(struct ble_gap_event *event, void *arg)
     return 0;
 }
 
-/**
- * @brief 开始BLE扫描
- */
-static void ble_central_scan(void)
-{
+static void ble_central_scan(void) {
     ESP_LOGI(TAG, "Starting BLE scan (Observer Mode)...");
     struct ble_gap_disc_params disc_params = {0};
     disc_params.passive = 1;
@@ -170,37 +238,28 @@ static void ble_central_scan(void)
     ble_gap_disc(BLE_OWN_ADDR_PUBLIC, BLE_HS_FOREVER, &disc_params, ble_central_gap_event, NULL);
 }
 
-/**
- * @brief BLE协议栈同步完成回调
- */
-static void ble_central_on_sync(void)
-{
+static void ble_central_on_sync(void) {
     uint8_t addr_type;
     int rc = ble_hs_id_infer_auto(0, &addr_type);
     if (rc != 0) {
         ESP_LOGE(TAG, "Error inferring address; rc=%d", rc);
         return;
     }
-    ESP_LOGI(TAG, "BLE stack synced. Starting scan.");
-    ble_central_scan();
+    g_ble_synced = true;
+    if (g_wifi_connected) {
+        ble_central_scan();
+    }
 }
 
-/**
- * @brief NimBLE主机任务
- */
-void ble_host_task(void *param)
-{
+void ble_host_task(void *param) {
     nimble_port_run();
     nimble_port_freertos_deinit();
 }
 
-/**
- * @brief 专用于轮播显示OLED的独立任务 (防频闪版)
- */
-static void display_task(void *pvParameters)
-{
+// --- Tasks ---
+static void display_task(void *pvParameters) {
     int current_node_index = 0;
-    bool is_displaying_data = false;
+    bool all_systems_go = false;
 
     while (1) {
         if (g_oled_handle == NULL) {
@@ -208,22 +267,39 @@ static void display_task(void *pvParameters)
             continue;
         }
 
-        if (g_active_node_count == 0) {
-            if (is_displaying_data) {
-                ssd1306_clear_display(g_oled_handle, false);
-                is_displaying_data = false;
+        all_systems_go = g_sd_card_mounted && g_sntp_initialized && g_wifi_connected;
+
+        ssd1306_clear_display(g_oled_handle, false);
+
+        if (!all_systems_go) {
+            // 显示系统自检状态
+            ssd1306_display_text(g_oled_handle, 0, "System Status:", false);
+            
+            char status_buf[32];
+            // *** 核心修改：显示具体的错误码 ***
+            if (g_sd_card_mounted) {
+                snprintf(status_buf, sizeof(status_buf), "SD Card: OK");
+            } else {
+                snprintf(status_buf, sizeof(status_buf), "SD Card: FAIL(%d)", g_sd_card_err);
             }
+            ssd1306_display_text(g_oled_handle, 2, status_buf, false);
+
+            snprintf(status_buf, sizeof(status_buf), "Wi-Fi:   %s", g_wifi_connected ? "OK" : "...");
+            ssd1306_display_text(g_oled_handle, 4, status_buf, false);
+
+            snprintf(status_buf, sizeof(status_buf), "Time:    %s", g_sntp_initialized ? "OK" : "...");
+            ssd1306_display_text(g_oled_handle, 6, status_buf, false);
+            
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        // --- 所有系统就绪，显示节点数据 ---
+        if (g_active_node_count == 0) {
             ssd1306_display_text(g_oled_handle, 0, "Scanning...", false);
             ssd1306_display_text(g_oled_handle, 2, "No nodes found.", false);
         } else {
-            if (!is_displaying_data) {
-                ssd1306_clear_display(g_oled_handle, false);
-                is_displaying_data = true;
-            }
-            
-            if (current_node_index >= g_active_node_count) {
-                current_node_index = 0;
-            }
+            if (current_node_index >= g_active_node_count) current_node_index = 0;
             
             sensor_node_status_t *node = &g_sensor_nodes[current_node_index];
             char line_buf[32];
@@ -240,26 +316,16 @@ static void display_task(void *pvParameters)
                 snprintf(line_buf, sizeof(line_buf), "#%d/%d ID:%-3d ON ", current_node_index + 1, g_active_node_count, node->node_id);
                 ssd1306_display_text(g_oled_handle, 0, line_buf, false);
                 
-                // *** 核心修改：检查每个值是否有效，无效则显示'error' ***
-                if (isnan(node->temperature)) {
-                    snprintf(line_buf, sizeof(line_buf), "Temp: error     ");
-                } else {
-                    snprintf(line_buf, sizeof(line_buf), "Temp: %.2f C   ", node->temperature);
-                }
+                if (isnan(node->temperature)) snprintf(line_buf, sizeof(line_buf), "Temp: error     ");
+                else snprintf(line_buf, sizeof(line_buf), "Temp: %.2f C   ", node->temperature);
                 ssd1306_display_text(g_oled_handle, 2, line_buf, false);
 
-                if (isnan(node->humidity)) {
-                    snprintf(line_buf, sizeof(line_buf), "Humi: error     ");
-                } else {
-                    snprintf(line_buf, sizeof(line_buf), "Humi: %.2f %%   ", node->humidity);
-                }
+                if (isnan(node->humidity)) snprintf(line_buf, sizeof(line_buf), "Humi: error     ");
+                else snprintf(line_buf, sizeof(line_buf), "Humi: %.2f %%   ", node->humidity);
                 ssd1306_display_text(g_oled_handle, 4, line_buf, false);
 
-                if (node->illuminance == LUX_ERROR_VAL) {
-                    snprintf(line_buf, sizeof(line_buf), "Lux:  error     ");
-                } else {
-                    snprintf(line_buf, sizeof(line_buf), "Lux:  %u      ", node->illuminance);
-                }
+                if (node->illuminance == LUX_ERROR_VAL) snprintf(line_buf, sizeof(line_buf), "Lux:  error     ");
+                else snprintf(line_buf, sizeof(line_buf), "Lux:  %u      ", node->illuminance);
                 ssd1306_display_text(g_oled_handle, 6, line_buf, false);
             }
             current_node_index++;
@@ -269,22 +335,91 @@ static void display_task(void *pvParameters)
     }
 }
 
-void app_main(void)
-{
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
+static void logging_task(void *pvParameters) {
+    adv_sensor_data_t received_data;
 
-    memset(g_sensor_nodes, 0, sizeof(g_sensor_nodes));
+    while (1) {
+        if (xQueueReceive(g_logging_queue, &received_data, portMAX_DELAY)) {
+            // Update the global state for OLED display
+            uint8_t node_id = received_data.node_id;
+            int node_index = -1;
+            for (int i = 0; i < g_active_node_count; i++) {
+                if (g_sensor_nodes[i].node_id == node_id) {
+                    node_index = i;
+                    break;
+                }
+            }
+            if (node_index == -1 && g_active_node_count < MAX_SENSOR_NODES) {
+                node_index = g_active_node_count;
+                g_sensor_nodes[node_index].node_id = node_id;
+                g_active_node_count++;
+            }
+            if (node_index != -1) {
+                if (received_data.temperature == TEMP_ERROR_VAL) g_sensor_nodes[node_index].temperature = NAN;
+                else g_sensor_nodes[node_index].temperature = (float)received_data.temperature / 100.0f;
+
+                if (received_data.humidity == HUMI_ERROR_VAL) g_sensor_nodes[node_index].humidity = NAN;
+                else g_sensor_nodes[node_index].humidity = (float)received_data.humidity / 100.0f;
+                
+                g_sensor_nodes[node_index].illuminance = received_data.illuminance;
+                g_sensor_nodes[node_index].last_seen = time(NULL);
+            }
+
+            // --- Perform SD Card Logging ---
+            if (!g_sd_card_mounted || !g_sntp_initialized) {
+                ESP_LOGW(TAG, "Skipping log write: SD mounted: %d, Time synced: %d", g_sd_card_mounted, g_sntp_initialized);
+                continue;
+            }
+
+            char filepath[32];
+            snprintf(filepath, sizeof(filepath), SD_CARD_MOUNT_POINT "/node_%d.csv", received_data.node_id);
+
+            struct stat st;
+            bool file_exists = (stat(filepath, &st) == 0);
+
+            FILE *f = fopen(filepath, "a");
+            if (f == NULL) {
+                ESP_LOGE(TAG, "Failed to open file for writing: %s", filepath);
+                continue;
+            }
+
+            if (!file_exists) {
+                fprintf(f, "Timestamp,Temperature,Humidity,Illuminance\n");
+                ESP_LOGI(TAG, "Created new log file and wrote header: %s", filepath);
+            }
+
+            time_t now = time(NULL);
+            struct tm timeinfo = {0};
+            localtime_r(&now, &timeinfo);
+            char time_buf[64];
+            strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+
+            fprintf(f, "%s,%.2f,%.2f,%u\n",
+                    time_buf,
+                    g_sensor_nodes[node_index].temperature,
+                    g_sensor_nodes[node_index].humidity,
+                    g_sensor_nodes[node_index].illuminance == LUX_ERROR_VAL ? 0 : g_sensor_nodes[node_index].illuminance);
+            
+            fclose(f);
+        }
+    }
+}
+
+
+// --- Main ---
+void app_main(void) {
+    ESP_ERROR_CHECK(nvs_flash_init());
+    
+    g_logging_queue = xQueueCreate(10, sizeof(adv_sensor_data_t));
 
     oled_init();
+    sd_card_init();
+    wifi_init();
 
     nimble_port_init();
     ble_hs_cfg.sync_cb = ble_central_on_sync;
     nimble_port_freertos_init(ble_host_task);
 
-    xTaskCreate(display_task, "display_task", 2048, NULL, 5, NULL);
+    xTaskCreate(display_task, "display_task", 4096, NULL, 5, NULL);
+    xTaskCreate(logging_task, "logging_task", 4096, NULL, 4, NULL);
 }

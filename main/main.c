@@ -1,6 +1,6 @@
 /**
  * @file main.c
- * @brief ROBUST: ESP32 NimBLE Observer with OLED Display for Multi-Node Network
+ * @brief ROBUST: ESP32 NimBLE Observer with OLED Display and UART JSON Output
  *
  * This device operates in a connectionless observer mode:
  * 1. It continuously scans for advertising packets.
@@ -9,12 +9,14 @@
  * 4. It stores the latest data for up to 36 nodes.
  * 5. A dedicated task cyclically displays node data, using partial refresh to prevent flicker
  * and implementing a timeout to show offline nodes.
- * This is a highly scalable, power-efficient architecture for data collection.
+ * 6. Upon receiving valid data from specific nodes (ID 1 or 2), it sends a formatted
+ * JSON string via UART, suitable for a 4G module and a cloud platform like OneNET.
+ * This is a highly scalable, power-efficient architecture for data collection and IoT forwarding.
  */
 #include <stdio.h>
 #include <string.h>
-#include <limits.h> // For INT16_MAX etc.
-#include <math.h>   // For isnan
+#include <limits.h> 
+#include <math.h>  
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -34,6 +36,9 @@
 #include "driver/i2c_master.h"
 #include "ssd1306.h"
 
+
+#include "driver/uart.h"
+
 static const char *TAG = "NIMBLE_OBSERVER_OLED";
 
 // I2C 和 OLED 配置
@@ -42,6 +47,13 @@ static const char *TAG = "NIMBLE_OBSERVER_OLED";
 #define I2C_SDA_PIN          GPIO_NUM_5
 #define DISPLAY_CYCLE_TIME_S 3 // 每个节点数据显示的秒数
 #define NODE_TIMEOUT_S       30 // 节点被认为离线的秒数
+
+//  UART 配置 
+#define UART_PORT_NUM    UART_NUM_1
+#define UART_TXD_PIN     GPIO_NUM_17 // 连接到4G模块RXD
+#define UART_RXD_PIN     GPIO_NUM_18 // TXD
+#define UART_BAUD_RATE   115200
+#define UART_BUF_SIZE    1024
 
 // 目标广播数据配置 (必须与传感器节点匹配)
 #define CUSTOM_MANU_ID       0x02E5 // Espressif Inc. 的官方蓝牙公司ID
@@ -60,9 +72,9 @@ typedef struct {
 #pragma pack(pop)
 
 // 定义错误码 (必须与传感器节点一致)
-#define TEMP_ERROR_VAL      INT16_MAX
-#define HUMI_ERROR_VAL      UINT16_MAX
-#define LUX_ERROR_VAL       UINT16_MAX
+#define TEMP_ERROR_VAL       INT16_MAX
+#define HUMI_ERROR_VAL       UINT16_MAX
+#define LUX_ERROR_VAL        UINT16_MAX
 
 // 用于存储所有节点数据的结构
 typedef struct {
@@ -83,6 +95,72 @@ static ssd1306_handle_t g_oled_handle = NULL;
 
 // 函数声明
 static void ble_central_scan(void);
+static void send_json_via_uart(const sensor_node_status_t *node); // NEW
+
+/**
+ * @brief  uart初始化 
+ */
+static void uart_init(void) {
+    uart_config_t uart_config = {
+        .baud_rate = UART_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    // 驱动Uart
+    ESP_ERROR_CHECK(uart_driver_install(UART_PORT_NUM, UART_BUF_SIZE * 2, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &uart_config));
+    // 设置 UART 引脚 ，默认用uart1
+    ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, UART_TXD_PIN, UART_RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    ESP_LOGI(TAG, "UART Initialized on port %d", UART_PORT_NUM);
+}
+
+/**
+ * @brief  通过uart发送json格式数据 
+ * @param 
+ */
+static void send_json_via_uart(const sensor_node_status_t *node) {
+    char json_buffer[256];
+    int len = 0;
+
+    // Node ID 1 (Temp, Humi, Lux)
+    if (node->node_id == 1) {
+        // Only send if all sensor values are valid
+        if (!isnan(node->temperature) && !isnan(node->humidity) && node->illuminance != LUX_ERROR_VAL) {
+            len = snprintf(json_buffer, sizeof(json_buffer),
+                "{\"id\":\"%d\",\"version\":\"1.0\",\"params\":{\"humidity\":{\"value\":%.2f},\"temperature\":{\"value\":%.2f},\"illuminance\":{\"value\":%u}}}",
+                node->node_id, node->humidity, node->temperature, node->illuminance);
+        } else {
+            ESP_LOGW(TAG, "Node 1 has invalid sensor data. UART message skipped.");
+            return;
+        }
+    }
+    //   Node ID 2 (Temp, Humi only)
+    else if (node->node_id == 2) {
+        // Only send if all sensor values are valid
+        if (!isnan(node->temperature) && !isnan(node->humidity)) {
+            len = snprintf(json_buffer, sizeof(json_buffer),
+                "{\"id\":\"%d\",\"version\":\"1.0\",\"params\":{\"humidity2\":{\"value\":%.2f},\"temperature2\":{\"value\":%.2f}}}",
+                node->node_id, node->humidity, node->temperature);
+        } else {
+            ESP_LOGW(TAG, "Node 2 has invalid sensor data. UART message skipped.");
+            return;
+        }
+    }
+    else {
+        // 其他id节点暂时什么也不做，后续改
+        return;
+    }
+
+    // 发送json格式数据
+    if (len > 0) {
+        uart_write_bytes(UART_PORT_NUM, json_buffer, len);
+        ESP_LOGI(TAG, "Sent JSON via UART for Node ID %d: %s", node->node_id, json_buffer);
+    }
+}
+
 
 /**
  * @brief 初始化OLED屏幕
@@ -133,23 +211,28 @@ static int ble_central_gap_event(struct ble_gap_event *event, void *arg)
                     }
 
                     if (node_index != -1) {
+                        sensor_node_status_t* current_node = &g_sensor_nodes[node_index];
+
                         // 检查每个传感器值是否为错误码
                         if (data->temperature == TEMP_ERROR_VAL) {
-                            g_sensor_nodes[node_index].temperature = NAN;
+                            current_node->temperature = NAN;
                         } else {
-                            g_sensor_nodes[node_index].temperature = (float)data->temperature / 100.0f;
+                            current_node->temperature = (float)data->temperature / 100.0f;
                         }
 
                         if (data->humidity == HUMI_ERROR_VAL) {
-                            g_sensor_nodes[node_index].humidity = NAN;
+                            current_node->humidity = NAN;
                         } else {
-                            g_sensor_nodes[node_index].humidity = (float)data->humidity / 100.0f;
+                            current_node->humidity = (float)data->humidity / 100.0f;
                         }
                         
-                        g_sensor_nodes[node_index].illuminance = data->illuminance;
-                        g_sensor_nodes[node_index].last_seen = time(NULL);
+                        current_node->illuminance = data->illuminance;
+                        current_node->last_seen = time(NULL);
 
                         ESP_LOGI(TAG, "Received data from Node ID: %d", node_id);
+                        
+                        // *** NEW: Send data via UART after processing ***
+                        send_json_via_uart(current_node);
                     }
                 }
             }
@@ -233,25 +316,25 @@ static void display_task(void *pvParameters)
             if (is_offline) {
                 snprintf(line_buf, sizeof(line_buf), "#%d/%d ID:%-3d OFF", current_node_index + 1, g_active_node_count, node->node_id);
                 ssd1306_display_text(g_oled_handle, 0, line_buf, false);
-                ssd1306_display_text(g_oled_handle, 2, "                ", false);
-                ssd1306_display_text(g_oled_handle, 4, "    OFFLINE     ", false);
-                ssd1306_display_text(g_oled_handle, 6, "                ", false);
+                ssd1306_display_text(g_oled_handle, 2, "                ", false); // Clear line
+                ssd1306_display_text(g_oled_handle, 4, "   OFFLINE      ", false);
+                ssd1306_display_text(g_oled_handle, 6, "                ", false); // Clear line
             } else {
                 snprintf(line_buf, sizeof(line_buf), "#%d/%d ID:%-3d ON ", current_node_index + 1, g_active_node_count, node->node_id);
                 ssd1306_display_text(g_oled_handle, 0, line_buf, false);
                 
-                // *** 核心修改：检查每个值是否有效，无效则显示'error' ***
+                // 修改：检查每个值是否有效，无效则显示'error' 
                 if (isnan(node->temperature)) {
                     snprintf(line_buf, sizeof(line_buf), "Temp: error     ");
                 } else {
-                    snprintf(line_buf, sizeof(line_buf), "Temp: %.2f C   ", node->temperature);
+                    snprintf(line_buf, sizeof(line_buf), "Temp: %.2f C  ", node->temperature);
                 }
                 ssd1306_display_text(g_oled_handle, 2, line_buf, false);
 
                 if (isnan(node->humidity)) {
                     snprintf(line_buf, sizeof(line_buf), "Humi: error     ");
                 } else {
-                    snprintf(line_buf, sizeof(line_buf), "Humi: %.2f %%   ", node->humidity);
+                    snprintf(line_buf, sizeof(line_buf), "Humi: %.2f %%  ", node->humidity);
                 }
                 ssd1306_display_text(g_oled_handle, 4, line_buf, false);
 
@@ -281,6 +364,7 @@ void app_main(void)
     memset(g_sensor_nodes, 0, sizeof(g_sensor_nodes));
 
     oled_init();
+    uart_init(); 
 
     nimble_port_init();
     ble_hs_cfg.sync_cb = ble_central_on_sync;

@@ -16,5 +16,6 @@
     "--compile-commands-dir=${workspaceFolder}\\build"
   ],
   "idf.flashType": "UART",
-  "idf.portWin": "COM5"
+  "idf.portWin": "COM5",
+  "idf.currentSetup": "d:\\esp\\v5.5\\esp-idf"
 }

@@ -17,5 +17,9 @@
   ],
   "idf.flashType": "UART",
   "idf.portWin": "COM5",
-  "idf.currentSetup": "d:\\esp\\v5.5\\esp-idf"
+  "idf.currentSetup": "d:\\esp\\v5.5\\esp-idf",
+  "files.associations": {
+    "gpio.h": "c",
+    "ble_svc_gap.h": "c"
+  }
 }
